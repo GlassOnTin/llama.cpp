@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <unordered_set>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1446,21 +1447,82 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 }
 
-void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
-    GGML_ASSERT(!mappings.empty());
-    const auto & mapping = mappings.at(idx);
+// merge a list of [first, last) ranges into a sorted, non-overlapping list
+static llama_mmap::ranges merge_ranges(llama_mmap::ranges ranges) {
+    std::sort(ranges.begin(), ranges.end());
 
-    *first = mapping->size();
-    *last  = 0;
-    *addr = mapping->addr();
+    llama_mmap::ranges res;
+    for (const auto & range : ranges) {
+        if (!res.empty() && range.first <= res.back().second) {
+            res.back().second = std::max(res.back().second, range.second);
+        } else {
+            res.push_back(range);
+        }
+    }
+
+    return res;
+}
+
+// subtract the sorted, non-overlapping ranges 'sub' from 'a'
+static llama_mmap::ranges sub_ranges(const llama_mmap::ranges & a, const llama_mmap::ranges & sub) {
+    llama_mmap::ranges res;
+
+    for (const auto & x : a) {
+        size_t cur = x.first;
+        for (const auto & y : sub) {
+            if (y.second <= cur || y.first >= x.second) {
+                continue;
+            }
+            if (y.first > cur) {
+                res.emplace_back(cur, y.first);
+            }
+            cur = std::max(cur, y.second);
+        }
+        if (cur < x.second) {
+            res.emplace_back(cur, x.second);
+        }
+    }
+
+    return res;
+}
+
+std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(int idx, ggml_context * ctx) const {
+    GGML_ASSERT((size_t) idx < mappings.size());
+
+    // data of this context, and data of the other contexts that share the same file
+    // a weight that is mapped in several contexts (e.g. the token embedding) is not foreign data
+    std::unordered_set<const llama_tensor_weight *> own;
+    llama_mmap::ranges own_ranges;
+    llama_mmap::ranges other;
+
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || weight->idx != (uint32_t) idx) {
             continue;
         }
-        *first = std::min(*first, weight->offs);
-        *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+        own.insert(weight);
+        own_ranges.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
     }
+
+    for (const auto & it : ctx_map) {
+        if (!it.second || it.second.get() == ctx) {
+            continue;
+        }
+
+        for (ggml_tensor * tensor = ggml_get_first_tensor(it.second.get()); tensor;
+                tensor = ggml_get_next_tensor(it.second.get(), tensor)) {
+            const auto * weight = get_weight(ggml_get_name(tensor));
+            if (!weight || weight->idx != (uint32_t) idx || own.count(weight)) {
+                continue;
+            }
+            other.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
+        }
+    }
+
+    // leaving out the ranges of the other contexts keeps them out of this context's backend buffer,
+    // which would otherwise pin data that the backend never reads (lazy tensors are the extreme
+    // case - the whole point of reading them lazily is to keep them out of RAM)
+    return sub_ranges(merge_ranges(std::move(own_ranges)), merge_ranges(std::move(other)));
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
@@ -1640,11 +1702,19 @@ bool llama_model_loader::load_all_data(
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
-            ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+            // the tensors of a file can be spread across several buffers, each one mapping a
+            // contiguous range of the file (see get_mapping_ranges) - find the one containing this
+            // tensor's data
+            ggml_backend_buffer_t buf_mmap = nullptr;
+            for (const auto & buf : bufs) {
+                const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf.second);
+                if (base && base <= data && data + n_size <= base + ggml_backend_buffer_get_size(buf.second)) {
+                    buf_mmap = buf.second;
+                    break;
+                }
+            }
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
