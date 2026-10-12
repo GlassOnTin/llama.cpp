@@ -1927,7 +1927,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 void * addr = ml.mappings.at(idx)->addr();
 
                 for (const auto & range : ml.get_mapping_ranges(idx, ctx)) {
-                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + range.first, range.second - range.first, max_size);
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + range.first, range.last - range.first, max_size);
                     if (buf == nullptr) {
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }

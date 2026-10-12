@@ -1447,14 +1447,16 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 }
 
-// merge a list of [first, last) ranges into a sorted, non-overlapping list
-static llama_mmap::ranges merge_ranges(llama_mmap::ranges ranges) {
-    std::sort(ranges.begin(), ranges.end());
+using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
 
-    llama_mmap::ranges res;
+// merge a list of [first, last) ranges into a sorted, non-overlapping list
+static mapping_ranges merge_ranges(mapping_ranges ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+
+    mapping_ranges res;
     for (const auto & range : ranges) {
-        if (!res.empty() && range.first <= res.back().second) {
-            res.back().second = std::max(res.back().second, range.second);
+        if (!res.empty() && range.first <= res.back().last) {
+            res.back().last = std::max(res.back().last, range.last);
         } else {
             res.push_back(range);
         }
@@ -1464,36 +1466,36 @@ static llama_mmap::ranges merge_ranges(llama_mmap::ranges ranges) {
 }
 
 // subtract the sorted, non-overlapping ranges 'sub' from 'a'
-static llama_mmap::ranges sub_ranges(const llama_mmap::ranges & a, const llama_mmap::ranges & sub) {
-    llama_mmap::ranges res;
+static mapping_ranges sub_ranges(const mapping_ranges & a, const mapping_ranges & sub) {
+    mapping_ranges res;
 
     for (const auto & x : a) {
         size_t cur = x.first;
         for (const auto & y : sub) {
-            if (y.second <= cur || y.first >= x.second) {
+            if (y.last <= cur || y.first >= x.last) {
                 continue;
             }
             if (y.first > cur) {
-                res.emplace_back(cur, y.first);
+                res.push_back({ cur, y.first });
             }
-            cur = std::max(cur, y.second);
+            cur = std::max(cur, y.last);
         }
-        if (cur < x.second) {
-            res.emplace_back(cur, x.second);
+        if (cur < x.last) {
+            res.push_back({ cur, x.last });
         }
     }
 
     return res;
 }
 
-std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(int idx, ggml_context * ctx) const {
+std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_ranges(int idx, ggml_context * ctx) const {
     GGML_ASSERT((size_t) idx < mappings.size());
 
     // data of this context, and data of the other contexts that share the same file
     // a weight that is mapped in several contexts (e.g. the token embedding) is not foreign data
     std::unordered_set<const llama_tensor_weight *> own;
-    llama_mmap::ranges own_ranges;
-    llama_mmap::ranges other;
+    mapping_ranges own_ranges;
+    mapping_ranges other;
 
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
@@ -1501,7 +1503,7 @@ std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(in
             continue;
         }
         own.insert(weight);
-        own_ranges.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
+        own_ranges.push_back({ weight->offs, weight->offs + ggml_nbytes(tensor) });
     }
 
     for (const auto & it : ctx_map) {
@@ -1514,7 +1516,7 @@ std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(in
             if (!weight || weight->idx != (uint32_t) idx || own.count(weight)) {
                 continue;
             }
-            other.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
+            other.push_back({ weight->offs, weight->offs + ggml_nbytes(tensor) });
         }
     }
 
