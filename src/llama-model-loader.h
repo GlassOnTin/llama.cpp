@@ -242,10 +242,6 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
-    // file ranges that back the tensors of a context and that can be wrapped by a backend buffer
-    // ranges owned by the buffers of other contexts (lazy tensors, MoE tensors moved to the CPU
-    // with -cmoe, etc) are excluded, because mapping them into this context's buffer would make
-    // the backend pin data that it never reads
     std::vector<std::pair<size_t, size_t>> get_mapping_ranges(int idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages

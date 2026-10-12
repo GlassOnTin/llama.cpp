@@ -1509,8 +1509,7 @@ std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(in
             continue;
         }
 
-        for (ggml_tensor * tensor = ggml_get_first_tensor(it.second.get()); tensor;
-                tensor = ggml_get_next_tensor(it.second.get(), tensor)) {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(it.second.get()); tensor; tensor = ggml_get_next_tensor(it.second.get(), tensor)) {
             const auto * weight = get_weight(ggml_get_name(tensor));
             if (!weight || weight->idx != (uint32_t) idx || own.count(weight)) {
                 continue;
@@ -1519,9 +1518,6 @@ std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(in
         }
     }
 
-    // leaving out the ranges of the other contexts keeps them out of this context's backend buffer,
-    // which would otherwise pin data that the backend never reads (lazy tensors are the extreme
-    // case - the whole point of reading them lazily is to keep them out of RAM)
     return sub_ranges(merge_ranges(std::move(own_ranges)), merge_ranges(std::move(other)));
 }
 
@@ -1704,9 +1700,7 @@ bool llama_model_loader::load_all_data(
             const auto & mapping = mappings.at(weight->idx);
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
-            // the tensors of a file can be spread across several buffers, each one mapping a
-            // contiguous range of the file (see get_mapping_ranges) - find the one containing this
-            // tensor's data
+            // the tensors of a file can be spread across several buffers - find the one containing this tensor's data
             ggml_backend_buffer_t buf_mmap = nullptr;
             for (const auto & buf : bufs) {
                 const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf.second);
